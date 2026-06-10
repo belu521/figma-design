@@ -1,15 +1,31 @@
 #include <Adafruit_NeoPixel.h>
+#include <WiFi.h>
+#include <WiFiUdp.h>
 
 // ESP32-S3 reads controls and LEDs, then exchanges compact MIDI/LED packets with Pro Micro.
 // Adapted for grandMA3 onPC:
 //   - Faders send CC only (no duplicate Note messages).
 //   - Encoders default to absolute CC mode (MA3 MIDI Remote "Fader" type friendly).
 //   - MA3 MIDI output feedback (Note/CC via Pro Micro downlink) drives button/fader LEDs.
+//   - OSC over WiFi: real-time executor appearance colors from a grandMA3 Lua plugin
+//     drive button/fader LED colors (see ma3_plugin/ColorFeedback.lua).
 // Wire ESP32 TX -> Pro Micro RX1, Pro Micro TX1 -> ESP32 RX, GND -> GND.
 
 #define ESP32_TO_PROMICRO_BAUD 31250
 #define ESP32_TX_PIN 43
 #define ESP32_RX_PIN 44
+
+// --- OSC color feedback over WiFi ---
+// Set ENABLE_OSC_COLOR_FEEDBACK to 0 to fall back to MIDI-only feedback.
+// The MA3 Lua plugin sends:
+//   /btn/<note>   ,iii  r g b   (0-255, executor appearance color for Note 70-89)
+//   /fader/<cc>   ,iii  r g b   (0-255, executor appearance color for CC 46-55)
+// All-zero RGB clears the color override (LED returns to default behavior).
+#define ENABLE_OSC_COLOR_FEEDBACK 1
+#define WIFI_SSID "YOUR_WIFI_SSID"
+#define WIFI_PASSWORD "YOUR_WIFI_PASSWORD"
+#define OSC_LISTEN_PORT 8000
+#define WIFI_RECONNECT_INTERVAL_MS 5000
 
 #define MIDI_CHANNEL 1
 
@@ -174,6 +190,15 @@ byte muxFaderFeedbackGreen[sizeof(muxFaders) / sizeof(muxFaders[0])];
 byte muxFaderFeedbackBlue[sizeof(muxFaders) / sizeof(muxFaders[0])];
 bool muxFaderMa3Active[sizeof(muxFaders) / sizeof(muxFaders[0])];
 byte muxFaderMa3Level[sizeof(muxFaders) / sizeof(muxFaders[0])];
+// OSC executor appearance colors (8-bit RGB, highest priority LED override).
+bool muxButtonOscColorActive[sizeof(muxButtons) / sizeof(muxButtons[0])];
+byte muxButtonOscRed[sizeof(muxButtons) / sizeof(muxButtons[0])];
+byte muxButtonOscGreen[sizeof(muxButtons) / sizeof(muxButtons[0])];
+byte muxButtonOscBlue[sizeof(muxButtons) / sizeof(muxButtons[0])];
+bool muxFaderOscColorActive[sizeof(muxFaders) / sizeof(muxFaders[0])];
+byte muxFaderOscRed[sizeof(muxFaders) / sizeof(muxFaders[0])];
+byte muxFaderOscGreen[sizeof(muxFaders) / sizeof(muxFaders[0])];
+byte muxFaderOscBlue[sizeof(muxFaders) / sizeof(muxFaders[0])];
 int muxLastValue[2][MUX_CHANNELS];
 uint32_t muxFaderFiltered[2][MUX_CHANNELS];
 bool muxFaderFilterInited[2][MUX_CHANNELS];
@@ -183,6 +208,11 @@ IncomingParserState incomingParserState = WAIT_HEADER;
 uint8_t incomingHeader = 0;
 uint8_t incomingData1 = 0;
 uint8_t incomingData2 = 0;
+
+#if ENABLE_OSC_COLOR_FEEDBACK
+WiFiUDP oscUdp;
+unsigned long lastWifiAttemptTime = 0;
+#endif
 
 Adafruit_NeoPixel strip1(LED_COUNT_1, LED_PIN_1, NEO_GRB + NEO_KHZ800);
 Adafruit_NeoPixel strip2(LED_COUNT_2, LED_PIN_2, NEO_GRB + NEO_KHZ800);
@@ -297,6 +327,19 @@ void renderMuxButtonLed(byte buttonIndex) {
     return;
   }
 
+  // OSC executor appearance color (real-time from MA3 Lua plugin) has top priority.
+  if (muxButtonOscColorActive[buttonIndex]) {
+    strip3.setPixelColor(
+      muxButtons[buttonIndex].ledIndex,
+      strip3.Color(
+        muxButtonOscRed[buttonIndex],
+        muxButtonOscGreen[buttonIndex],
+        muxButtonOscBlue[buttonIndex]
+      )
+    );
+    return;
+  }
+
   if (muxButtonFeedbackActive[buttonIndex]) {
     strip3.setPixelColor(
       muxButtons[buttonIndex].ledIndex,
@@ -325,6 +368,20 @@ void renderFaderLed(byte faderIndex, byte value) {
 
   // MA3 fader level feedback overrides the local value when present.
   byte displayValue = muxFaderMa3Active[faderIndex] ? muxFaderMa3Level[faderIndex] : value;
+
+  // OSC executor appearance color: tint the fader LED, brightness follows the level.
+  if (muxFaderOscColorActive[faderIndex]) {
+    byte brightnessPercent = map(displayValue, 0, 127, 5, 95);
+    strip3.setPixelColor(
+      ledIndex,
+      strip3.Color(
+        (uint16_t)muxFaderOscRed[faderIndex] * brightnessPercent / 100,
+        (uint16_t)muxFaderOscGreen[faderIndex] * brightnessPercent / 100,
+        (uint16_t)muxFaderOscBlue[faderIndex] * brightnessPercent / 100
+      )
+    );
+    return;
+  }
 
   if (muxFaderFeedbackActive[faderIndex]) {
     strip3.setPixelColor(
@@ -384,6 +441,10 @@ void initButtonFeedback() {
     muxButtonFeedbackGreen[i] = 0;
     muxButtonFeedbackBlue[i] = 0;
     muxButtonExecActive[i] = false;
+    muxButtonOscColorActive[i] = false;
+    muxButtonOscRed[i] = 0;
+    muxButtonOscGreen[i] = 0;
+    muxButtonOscBlue[i] = 0;
   }
   for (byte i = 0; i < muxFaderCount; i++) {
     muxFaderFeedbackActive[i] = false;
@@ -392,6 +453,10 @@ void initButtonFeedback() {
     muxFaderFeedbackBlue[i] = 0;
     muxFaderMa3Active[i] = false;
     muxFaderMa3Level[i] = 0;
+    muxFaderOscColorActive[i] = false;
+    muxFaderOscRed[i] = 0;
+    muxFaderOscGreen[i] = 0;
+    muxFaderOscBlue[i] = 0;
   }
 }
 
@@ -862,6 +927,160 @@ void readProMicroFeedback() {
   }
 }
 
+#if ENABLE_OSC_COLOR_FEEDBACK
+
+// --- Minimal OSC receiver for MA3 executor appearance colors ---
+// Accepts /btn/<note> and /fader/<cc> with three int32 (",iii") or
+// three float32 (",fff", 0.0-1.0) arguments: r g b.
+
+void applyOscButtonColor(byte note, byte r, byte g, byte b) {
+  int buttonIndex = findMuxButtonByMidiNote(note);
+  if (buttonIndex < 0) {
+    return;
+  }
+
+  if (r == 0 && g == 0 && b == 0) {
+    muxButtonOscColorActive[buttonIndex] = false;
+  } else {
+    muxButtonOscColorActive[buttonIndex] = true;
+    muxButtonOscRed[buttonIndex] = r;
+    muxButtonOscGreen[buttonIndex] = g;
+    muxButtonOscBlue[buttonIndex] = b;
+  }
+  renderMuxButtonLed(buttonIndex);
+  strip3.show();
+}
+
+void applyOscFaderColor(byte cc, byte r, byte g, byte b) {
+  int faderIndex = findMuxFaderByMidiNote(cc);
+  if (faderIndex < 0) {
+    return;
+  }
+
+  byte slot = muxFaders[faderIndex].faderIndex;
+  if (r == 0 && g == 0 && b == 0) {
+    muxFaderOscColorActive[slot] = false;
+  } else {
+    muxFaderOscColorActive[slot] = true;
+    muxFaderOscRed[slot] = r;
+    muxFaderOscGreen[slot] = g;
+    muxFaderOscBlue[slot] = b;
+  }
+
+  byte muxIndex = muxFaders[faderIndex].mux - 1;
+  byte channel = muxFaders[faderIndex].channel;
+  renderFaderLed(slot, muxLastValue[muxIndex][channel] >= 0 ? muxLastValue[muxIndex][channel] : 0);
+  strip3.show();
+}
+
+int oscPaddedLength(int length) {
+  return (length + 4) & ~3;
+}
+
+int32_t oscReadInt32(const uint8_t* data) {
+  return ((int32_t)data[0] << 24) | ((int32_t)data[1] << 16) | ((int32_t)data[2] << 8) | (int32_t)data[3];
+}
+
+float oscReadFloat32(const uint8_t* data) {
+  uint32_t bits = ((uint32_t)data[0] << 24) | ((uint32_t)data[1] << 16) | ((uint32_t)data[2] << 8) | (uint32_t)data[3];
+  float value;
+  memcpy(&value, &bits, sizeof(value));
+  return value;
+}
+
+byte oscClampColor(long value) {
+  if (value < 0) {
+    return 0;
+  }
+  if (value > 255) {
+    return 255;
+  }
+  return (byte)value;
+}
+
+void handleOscMessage(const uint8_t* packet, int packetSize) {
+  // Address pattern (null-terminated, padded to 4 bytes).
+  int addressLength = strnlen((const char*)packet, packetSize);
+  if (addressLength == 0 || addressLength >= packetSize) {
+    return;
+  }
+  const char* address = (const char*)packet;
+
+  int typeTagOffset = oscPaddedLength(addressLength);
+  if (typeTagOffset >= packetSize || packet[typeTagOffset] != ',') {
+    return;
+  }
+  const char* typeTags = (const char*)(packet + typeTagOffset);
+  int typeTagLength = strnlen(typeTags, packetSize - typeTagOffset);
+  int argOffset = typeTagOffset + oscPaddedLength(typeTagLength);
+
+  bool isInts = strcmp(typeTags, ",iii") == 0;
+  bool isFloats = strcmp(typeTags, ",fff") == 0;
+  if ((!isInts && !isFloats) || argOffset + 12 > packetSize) {
+    return;
+  }
+
+  byte rgb[3];
+  for (byte i = 0; i < 3; i++) {
+    const uint8_t* argData = packet + argOffset + i * 4;
+    if (isInts) {
+      rgb[i] = oscClampColor(oscReadInt32(argData));
+    } else {
+      rgb[i] = oscClampColor((long)(oscReadFloat32(argData) * 255.0f + 0.5f));
+    }
+  }
+
+  if (strncmp(address, "/btn/", 5) == 0) {
+    int note = atoi(address + 5);
+    if (note >= 0 && note <= 127) {
+      applyOscButtonColor((byte)note, rgb[0], rgb[1], rgb[2]);
+    }
+  } else if (strncmp(address, "/fader/", 7) == 0) {
+    int cc = atoi(address + 7);
+    if (cc >= 0 && cc <= 127) {
+      applyOscFaderColor((byte)cc, rgb[0], rgb[1], rgb[2]);
+    }
+  }
+}
+
+void maintainWifi() {
+  if (WiFi.status() == WL_CONNECTED) {
+    return;
+  }
+
+  unsigned long now = millis();
+  if (lastWifiAttemptTime != 0 && now - lastWifiAttemptTime < WIFI_RECONNECT_INTERVAL_MS) {
+    return;
+  }
+
+  lastWifiAttemptTime = now;
+  WiFi.disconnect();
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+}
+
+void initOsc() {
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+  lastWifiAttemptTime = millis();
+  oscUdp.begin(OSC_LISTEN_PORT);
+}
+
+void readOscColorFeedback() {
+  maintainWifi();
+
+  int packetSize = oscUdp.parsePacket();
+  while (packetSize > 0) {
+    static uint8_t buffer[256];
+    int length = oscUdp.read(buffer, sizeof(buffer));
+    if (length > 0 && buffer[0] == '/') {
+      handleOscMessage(buffer, length);
+    }
+    packetSize = oscUdp.parsePacket();
+  }
+}
+
+#endif  // ENABLE_OSC_COLOR_FEEDBACK
+
 void initControllerHardware() {
   initButtonFeedback();
   initEncoders();
@@ -874,6 +1093,10 @@ void setup() {
   Serial.begin(115200);
   Serial1.begin(ESP32_TO_PROMICRO_BAUD, SERIAL_8N1, ESP32_RX_PIN, ESP32_TX_PIN);
 
+#if ENABLE_OSC_COLOR_FEEDBACK
+  initOsc();
+#endif
+
   initLeds();
   runLedSelfTest();
   initControllerHardware();
@@ -881,6 +1104,9 @@ void setup() {
 
 void loop() {
   readProMicroFeedback();
+#if ENABLE_OSC_COLOR_FEEDBACK
+  readOscColorFeedback();
+#endif
   scanEncoders();
   scanEncoderButtons();
   scanMuxes();
