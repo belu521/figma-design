@@ -1,16 +1,18 @@
 -- ColorFeedback.lua
 -- grandMA3 onPC plugin: 实时把 executor 外观颜色 (Appearance) 通过 OSC 发送给 ESP32-S3 控制器。
--- 控制器固件 (firmware/esp32_s3) 在 OSC_LISTEN_PORT (默认 8000) 监听:
+-- OSC 经本机回环 UDP 发给 PC 桥接程序 (tools/osc_usb_bridge.py),
+-- 桥接程序再通过 USB 串口 (SLIP 封帧) 转发给控制器固件 (firmware/esp32_s3):
 --   /btn/<note>   iii  r g b   (0-255)  -> 矩阵按钮 LED 颜色
 --   /fader/<cc>   iii  r g b   (0-255)  -> 推子 LED 颜色
 -- 颜色为全 0 时控制器恢复默认 LED 行为。
 --
 -- 使用前提:
---   1. MA3 onPC: Menu -> In & Out -> OSC, 新建一行:
---      Destination IP = ESP32 的 IP, Port = 8000, Mode = UDP, 启用该行。
+--   1. 在 PC 上运行桥接程序: python tools/osc_usb_bridge.py --serial-port <ESP32串口号>
+--   2. MA3 onPC: Menu -> In & Out -> OSC, 新建一行:
+--      Destination IP = 127.0.0.1, Port = 8000, Mode = UDP, 启用该行。
 --      记下该行的编号 (oscConfigSlot)。
---   2. 修改下方 CONFIG 中的 executor 映射, 与 docs/MIDI_MAPPING.md 保持一致。
---   3. 导入插件并运行 (见 docs/OSC_COLOR_FEEDBACK.md)。
+--   3. 修改下方 CONFIG 中的 executor 映射, 与 docs/MIDI_MAPPING.md 保持一致。
+--   4. 导入插件并运行 (见 docs/OSC_COLOR_FEEDBACK.md)。
 
 local CONFIG = {
     -- MA3 中 Menu -> In & Out -> OSC 配置行编号

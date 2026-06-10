@@ -1,31 +1,31 @@
 #include <Adafruit_NeoPixel.h>
-#include <WiFi.h>
-#include <WiFiUdp.h>
 
 // ESP32-S3 reads controls and LEDs, then exchanges compact MIDI/LED packets with Pro Micro.
 // Adapted for grandMA3 onPC:
 //   - Faders send CC only (no duplicate Note messages).
 //   - Encoders default to absolute CC mode (MA3 MIDI Remote "Fader" type friendly).
 //   - MA3 MIDI output feedback (Note/CC via Pro Micro downlink) drives button/fader LEDs.
-//   - OSC over WiFi: real-time executor appearance colors from a grandMA3 Lua plugin
-//     drive button/fader LED colors (see ma3_plugin/ColorFeedback.lua).
+//   - OSC over USB: real-time executor appearance colors from a grandMA3 Lua plugin,
+//     relayed by tools/osc_usb_bridge.py as SLIP-framed OSC over the native USB CDC
+//     serial port, drive button/fader LED colors (see ma3_plugin/ColorFeedback.lua).
 // Wire ESP32 TX -> Pro Micro RX1, Pro Micro TX1 -> ESP32 RX, GND -> GND.
 
 #define ESP32_TO_PROMICRO_BAUD 31250
 #define ESP32_TX_PIN 43
 #define ESP32_RX_PIN 44
 
-// --- OSC color feedback over WiFi ---
+// --- OSC color feedback over USB (SLIP-framed OSC, OSC 1.1 serial transport) ---
 // Set ENABLE_OSC_COLOR_FEEDBACK to 0 to fall back to MIDI-only feedback.
+// Build with "USB CDC On Boot: Enabled" so Serial is the native USB port.
+// The PC bridge (tools/osc_usb_bridge.py) receives UDP OSC from the MA3 Lua
+// plugin on 127.0.0.1:8000 and forwards each datagram as one SLIP frame.
 // The MA3 Lua plugin sends:
 //   /btn/<note>   ,iii  r g b   (0-255, executor appearance color for Note 70-89)
 //   /fader/<cc>   ,iii  r g b   (0-255, executor appearance color for CC 46-55)
 // All-zero RGB clears the color override (LED returns to default behavior).
 #define ENABLE_OSC_COLOR_FEEDBACK 1
-#define WIFI_SSID "YOUR_WIFI_SSID"
-#define WIFI_PASSWORD "YOUR_WIFI_PASSWORD"
-#define OSC_LISTEN_PORT 8000
-#define WIFI_RECONNECT_INTERVAL_MS 5000
+#define OSC_USB_BAUD 115200
+#define OSC_SLIP_MAX_PACKET 256
 
 #define MIDI_CHANNEL 1
 
@@ -55,7 +55,8 @@
 #define FADER_MIN_INTERVAL_MS 25
 #define MUX_SCAN_INTERVAL_MS 5
 #define BUTTON_DEBOUNCE_MS 20
-#define DEBUG_RGB_FEEDBACK 1
+// USB CDC port carries inbound SLIP-OSC; keep debug output off to leave it clean.
+#define DEBUG_RGB_FEEDBACK 0
 
 // EC11 is a relative mechanical encoder. Each detent updates the encoder value.
 // ENCODER_ABSOLUTE_MODE 1: firmware accumulates an absolute 0-127 value and sends
@@ -210,8 +211,11 @@ uint8_t incomingData1 = 0;
 uint8_t incomingData2 = 0;
 
 #if ENABLE_OSC_COLOR_FEEDBACK
-WiFiUDP oscUdp;
-unsigned long lastWifiAttemptTime = 0;
+// SLIP (RFC 1055) framing state for OSC packets received over the USB CDC port.
+uint8_t slipBuffer[OSC_SLIP_MAX_PACKET];
+int slipLength = 0;
+bool slipEscaped = false;
+bool slipOverflow = false;
 #endif
 
 Adafruit_NeoPixel strip1(LED_COUNT_1, LED_PIN_1, NEO_GRB + NEO_KHZ800);
@@ -1046,39 +1050,48 @@ void handleOscMessage(const uint8_t* packet, int packetSize) {
   }
 }
 
-void maintainWifi() {
-  if (WiFi.status() == WL_CONNECTED) {
+// SLIP special characters (RFC 1055), as used by the OSC 1.1 serial transport.
+#define SLIP_END 0xC0
+#define SLIP_ESC 0xDB
+#define SLIP_ESC_END 0xDC
+#define SLIP_ESC_ESC 0xDD
+
+void slipDecodeByte(uint8_t b) {
+  if (b == SLIP_END) {
+    if (!slipOverflow && slipLength > 0 && slipBuffer[0] == '/') {
+      handleOscMessage(slipBuffer, slipLength);
+    }
+    slipLength = 0;
+    slipEscaped = false;
+    slipOverflow = false;
     return;
   }
 
-  unsigned long now = millis();
-  if (lastWifiAttemptTime != 0 && now - lastWifiAttemptTime < WIFI_RECONNECT_INTERVAL_MS) {
+  if (slipEscaped) {
+    slipEscaped = false;
+    if (b == SLIP_ESC_END) {
+      b = SLIP_END;
+    } else if (b == SLIP_ESC_ESC) {
+      b = SLIP_ESC;
+    } else {
+      slipOverflow = true;  // protocol violation, drop frame
+      return;
+    }
+  } else if (b == SLIP_ESC) {
+    slipEscaped = true;
     return;
   }
 
-  lastWifiAttemptTime = now;
-  WiFi.disconnect();
-  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
-}
-
-void initOsc() {
-  WiFi.mode(WIFI_STA);
-  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
-  lastWifiAttemptTime = millis();
-  oscUdp.begin(OSC_LISTEN_PORT);
+  if (slipLength >= (int)sizeof(slipBuffer)) {
+    slipOverflow = true;
+    return;
+  }
+  slipBuffer[slipLength++] = b;
 }
 
 void readOscColorFeedback() {
-  maintainWifi();
-
-  int packetSize = oscUdp.parsePacket();
-  while (packetSize > 0) {
-    static uint8_t buffer[256];
-    int length = oscUdp.read(buffer, sizeof(buffer));
-    if (length > 0 && buffer[0] == '/') {
-      handleOscMessage(buffer, length);
-    }
-    packetSize = oscUdp.parsePacket();
+  while (Serial.available() > 0) {
+    slipDecodeByte((uint8_t)Serial.read());
   }
 }
 
@@ -1093,12 +1106,8 @@ void initControllerHardware() {
 }
 
 void setup() {
-  Serial.begin(115200);
+  Serial.begin(OSC_USB_BAUD);
   Serial1.begin(ESP32_TO_PROMICRO_BAUD, SERIAL_8N1, ESP32_RX_PIN, ESP32_TX_PIN);
-
-#if ENABLE_OSC_COLOR_FEEDBACK
-  initOsc();
-#endif
 
   initLeds();
   runLedSelfTest();
