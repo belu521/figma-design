@@ -1007,11 +1007,14 @@ void handleOscMessage(const uint8_t* packet, int packetSize) {
   const char* address = (const char*)packet;
 
   int typeTagOffset = oscPaddedLength(addressLength);
-  if (typeTagOffset >= packetSize || packet[typeTagOffset] != ',') {
+  if (typeTagOffset + 4 > packetSize || packet[typeTagOffset] != ',') {
     return;
   }
   const char* typeTags = (const char*)(packet + typeTagOffset);
   int typeTagLength = strnlen(typeTags, packetSize - typeTagOffset);
+  if (typeTagLength >= packetSize - typeTagOffset) {
+    return;  // type tag string not null-terminated within packet
+  }
   int argOffset = typeTagOffset + oscPaddedLength(typeTagLength);
 
   bool isInts = strcmp(typeTags, ",iii") == 0;
